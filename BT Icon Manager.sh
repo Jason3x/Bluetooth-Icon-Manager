@@ -25,7 +25,7 @@ BLUETOOTH_ICON_SIZE="0.053"
 UPDATER_PATH="/usr/local/bin/bluetooth_icon_state_updater.sh"
 SERVICE_PATH="/etc/systemd/system/bluetooth-icon-updater.service"
 
-UPDATE_INTERVAL=1
+UPDATE_INTERVAL=2
 
 # --- Configuration initiale ---
 printf "\033c" > "$CURR_TTY"
@@ -94,54 +94,45 @@ restart_es_and_exit() {
     ExitMenu
 }
 
+# --- Fonction pour déterminer l'état actuel (utilisé pour la synchro immédiate) ---
+get_immediate_bt_state() {
+    # 1. Blocked
+    if rfkill list bluetooth | grep -q "Soft blocked: yes"; then echo "off"; return; fi
+    # 2. Service inactif
+    if ! systemctl is-active --quiet bluetooth; then echo "off"; return; fi
+    # 3. Powered off
+    if ! echo "show" | bluetoothctl | grep -q "Powered: yes"; then echo "off"; return; fi
+    # 4. Connecte via bluetoothctl
+    if echo "info" | bluetoothctl | grep -q "Connected: yes"; then echo "connected"; return; fi
+    # 5. Connecte via hcitool fallback
+    if command -v hcitool &> /dev/null; then
+        if hcitool con 2>/dev/null | grep -q "..:..:..:..:..:.."; then echo "connected"; return; fi
+    fi
+    # 6. Fallback check
+    if bluetoothctl devices Connected | grep -q ":"; then echo "connected"; return; fi
+    
+    echo "on_not_connected"
+}
+
 # --- Fonction pour créer le script en arrière-plan ---
 create_updater_script() {
     cat > "$UPDATER_PATH" << 'EOF'
 #!/bin/bash
 THEMES_DIR="/roms/themes"
-UPDATE_INTERVAL=1
+UPDATE_INTERVAL=2
 prev_state=""
 
 get_bluetooth_icon_state() {
-    # 1. Vérifier si il est bloqué
-    if rfkill list bluetooth | grep -q "Soft blocked: yes"; then
-        echo "off"
-        return
-    fi
-
-    # 2. Vérifier le service (IMPORTANT: ne pas réveiller le service s'il dort)
-    if ! systemctl is-active --quiet bluetooth; then
-        echo "off"
-        return
-    fi
-
-    # 3. Vérifier l'alimentation
-    if ! echo "show" | bluetoothctl | grep -q "Powered: yes"; then
-        echo "off"
-        return
-    fi
-
-    # 4. Vérifier la connexion
-    if echo "info" | bluetoothctl | grep -q "Connected: yes"; then
-        echo "connected"
-        return
-    fi
-    
+    if rfkill list bluetooth | grep -q "Soft blocked: yes"; then echo "off"; return; fi
+    if ! systemctl is-active --quiet bluetooth; then echo "off"; return; fi
+    if ! echo "show" | bluetoothctl | grep -q "Powered: yes"; then echo "off"; return; fi
+    if echo "info" | bluetoothctl | grep -q "Connected: yes"; then echo "connected"; return; fi
     if command -v hcitool &> /dev/null; then
-        if hcitool con 2>/dev/null | grep -q "..:..:..:..:..:.."; then
-            echo "connected"
-            return
-        fi
+        if hcitool con 2>/dev/null | grep -q "..:..:..:..:..:.."; then echo "connected"; return; fi
     fi
-    
-    if bluetoothctl devices Connected | grep -q ":"; then
-        echo "connected"
-        return
-    fi
-    
+    if bluetoothctl devices Connected | grep -q ":"; then echo "connected"; return; fi
     echo "on_not_connected"
 }
-
 
 while true; do
     current_state=$(get_bluetooth_icon_state)
@@ -183,6 +174,7 @@ while true; do
             fi
         done
         if [ "$need_restart" = true ]; then
+    sleep 2
             systemctl restart emulationstation
         fi
         prev_state="$current_state"
@@ -263,11 +255,12 @@ install_icons() {
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="#007bff" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M7 7l10 10-5 5V2l5 5-10 10"/></svg>
 EOF
                     cat > "$art_dir/bluetooth_on.bak.svg" << 'EOF'
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="#none" stroke="#ff6600" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M7 7l10 10-5 5V2l5 5-10 10"/></svg>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="#ff6600" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M7 7l10 10-5 5V2l5 5-10 10"/></svg>
 EOF
                     cat > "$art_dir/bluetooth_off.bak.svg" << 'EOF'
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="#dc3545" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M7 7l10 10-5 5V2l5 5-10 10"/><line x1="2" y1="22" x2="22" y2="2" /></svg>
 EOF
+                    # Par défaut on met OFF, mais on va le mettre à jour juste après
                     cp "$art_dir/bluetooth_off.bak.svg" "$art_dir/bluetooth.svg"
 
                     local icon_path_prefix=$(realpath --relative-to="$theme_path" "$art_dir")
@@ -293,6 +286,36 @@ EOF
             progress_text+="Theme: $(basename "$theme_path")\n"
         fi
     done
+
+    dialog --backtitle "$BACKTITLE" --title "Syncing" --infobox "\nWaiting for Bluetooth Status..." 5 40 > "$CURR_TTY"
+    
+    local final_status="off"
+    for i in $(seq 1 5); do
+        final_status=$(get_immediate_bt_state)
+        if [ "$final_status" == "connected" ]; then
+            break
+        fi
+        sleep 1
+    done
+
+    dialog --backtitle "$BACKTITLE" --title "Syncing" --infobox "\nApplying status: $final_status..." 5 40 > "$CURR_TTY"
+    
+    for theme_path in "$THEMES_DIR"/*; do
+        [ -d "$theme_path" ] || continue
+        [ -f "$theme_path/$BLUETOOTH_PATCH_MARKER" ] || continue
+        
+        art_dir="$theme_path/_art"
+        [ -d "$art_dir" ] || art_dir="$theme_path/art"
+        
+        if [ "$final_status" == "connected" ]; then
+             cp -f "$art_dir/bluetooth_connected.bak.svg" "$art_dir/bluetooth.svg" 2>/dev/null
+        elif [ "$final_status" == "on_not_connected" ]; then
+             cp -f "$art_dir/bluetooth_on.bak.svg" "$art_dir/bluetooth.svg" 2>/dev/null
+        else
+             cp -f "$art_dir/bluetooth_off.bak.svg" "$art_dir/bluetooth.svg" 2>/dev/null
+        fi
+    done
+    sleep 1
 
     dialog --backtitle "$BACKTITLE" --title "Patched" --msgbox "\n$progress_text" 0 0 > "$CURR_TTY"
     restart_es_and_exit
@@ -361,8 +384,11 @@ if command -v /opt/inttools/gptokeyb &> /dev/null; then
         chmod 666 /dev/uinput 2>/dev/null || true
     fi
     export SDL_GAMECONTROLLERCONFIG_FILE="/opt/inttools/gamecontrollerdb.txt"
-    pkill -f "gptokeyb -1 BT Icon Manager.sh" || true
-    /opt/inttools/gptokeyb -1 "Bluetooth-Icon-Manager.sh" -c "/opt/inttools/keys.gptk" >/dev/null 2>&1 &
+
+    SCRIPT_NAME=$(basename "$0")
+
+    pkill -f "gptokeyb -1 $SCRIPT_NAME" || true
+    /opt/inttools/gptokeyb -1 "$SCRIPT_NAME" -c "/opt/inttools/keys.gptk" >/dev/null 2>&1 &
 fi
 
 printf "\033c" > "$CURR_TTY"
